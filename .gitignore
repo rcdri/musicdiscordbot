@@ -2,3 +2,4 @@
 /.env
 /guild_data
 /mcdcbot.code-workspace
+/__pycache__
