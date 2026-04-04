@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+discord.py>=2.3.0
+davey>=0.1.0
+python-dotenv>=1.0.0
+# System dependency: ffmpeg must be installed separately and available on PATH.
