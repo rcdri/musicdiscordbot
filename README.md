@@ -1,4 +1,4 @@
-# mcdcbot
+# musicdiscordbot
 
 A Discord music bot that streams audio from [UNDISCLOSED]
 
