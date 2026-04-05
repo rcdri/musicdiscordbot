@@ -4,7 +4,7 @@ A Discord music bot that streams audio from [UNDISCLOSED]
 
 ## Features
 * Streams audio from [UNDISCLOSED] directly to Discord voice channels.
-* Accepts Spotify track/album/playlist/artist links by matching Spotify metadata to Tidal tracks before playback.
+* Accepts Spotify track/album/playlist/artist links by matching Spotify metadata to [UNDISCLOSED] tracks before playback.
 * Generates persistent playback history and configuration state per server.
 * Hidden owner-exclusive queue locks and configurable toggles (`u!tl`, `u!toe`).
 
