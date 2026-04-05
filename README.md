@@ -1,10 +1,10 @@
 # musicdiscordbot
 
-A Discord music bot that streams audio from [UNDISCLOSED]
+A Discord music bot that streams audio from Monochrome
 
 ## Features
-* Streams audio from [UNDISCLOSED] directly to Discord voice channels.
-* Accepts Spotify track/album/playlist/artist links by matching Spotify metadata to [UNDISCLOSED] tracks before playback.
+* Streams audio from Monochrome directly to Discord voice channels.
+* Accepts Spotify track/album/playlist/artist links by matching Spotify metadata to Monochrome tracks before playback.
 * Generates persistent playback history and configuration state per server.
 * Hidden owner-exclusive queue locks and configurable toggles (`u!tl`, `u!toe`).
 
