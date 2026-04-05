@@ -3,3 +3,7 @@
 /guild_data
 /mcdcbot.code-workspace
 /__pycache__
+/.vscode
+/.venv
+/.venv-1
+/test_regex.py
