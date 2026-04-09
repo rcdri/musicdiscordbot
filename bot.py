@@ -5,6 +5,7 @@ Tidal Discord Bot — monochrome API (hifi-api v2.0)
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -88,6 +89,18 @@ async def pick_best_api():
 QUEUE_COLUMNS = 3
 QUEUE_ROWS_PER_COLUMN = 8
 QUEUE_PAGE_SIZE = QUEUE_COLUMNS * QUEUE_ROWS_PER_COLUMN
+SPECTROGRAM_SIZE_CANDIDATES = [
+    "5120x2880",
+    "4096x2304",
+    "3840x2160",
+    "3200x1800",
+    "2560x1440",
+    "1920x1080",
+    "1280x720",
+]
+SPECTROGRAM_UPLOAD_HEADROOM_BYTES = 256 * 1024
+SPECTROGRAM_FALLBACK_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
+TIMESTAMPED_LYRICS_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = MyBot(command_prefix='u!', intents=intents, help_command=None)
@@ -103,6 +116,7 @@ current_tracks: dict[int, dict] = {}
 loop_modes: dict[int, str] = {}
 skip_requests: set[int] = set()
 voice_locks: dict[int, asyncio.Lock] = {}
+metadata_message_refs_by_guild: dict[int, list[dict[str, int]]] = {}
 
 
 def ensure_guild_data_dir(guild_id: int) -> str:
@@ -732,7 +746,27 @@ async def run_debug_self_tests() -> list[dict[str, str]]:
                 else:
                     _debug_record(results, "Spotify track search", "skip", f"HTTP {status}")
 
-    required_commands = ["help", "track", "album", "playlist", "artist", "skip", "previous", "queue", "link", "stop", "pause", "resume", "loop", "shuffle"]
+    required_commands = [
+        "help",
+        "track",
+        "album",
+        "playlist",
+        "artist",
+        "skip",
+        "previous",
+        "queue",
+        "link",
+        "spectrogram",
+        "trackinfo",
+        "cover",
+        "lyrics",
+        "audiostats",
+        "stop",
+        "pause",
+        "resume",
+        "loop",
+        "shuffle",
+    ]
     command_ok = all(bot.get_command(name) is not None for name in required_commands)
     _debug_record(results, "Core command registration", "pass" if command_ok else "fail", ", ".join(required_commands))
 
@@ -783,6 +817,115 @@ def get_history(guild_id: int) -> list:
     if guild_id not in histories:
         histories[guild_id] = []
     return histories[guild_id]
+
+
+def _track_entry_id(track_entry: dict[str, Any] | None) -> int | None:
+    if not isinstance(track_entry, dict):
+        return None
+    raw_track_id = track_entry.get("id")
+    try:
+        return int(raw_track_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_current_track_id(guild_id: int, track_id: int) -> bool:
+    return _track_entry_id(current_tracks.get(guild_id)) == track_id
+
+
+def _current_track_elapsed_seconds(guild_id: int, track_id: int) -> float:
+    if not _is_current_track_id(guild_id, track_id):
+        return 0.0
+
+    curr = current_tracks.get(guild_id) or {}
+    started_at_raw = curr.get("started_at")
+    if not isinstance(started_at_raw, str):
+        return 0.0
+
+    started_at = discord.utils.parse_time(started_at_raw)
+    if started_at is None:
+        return 0.0
+
+    now = discord.utils.utcnow()
+    if started_at.tzinfo is None and now.tzinfo is not None:
+        started_at = started_at.replace(tzinfo=now.tzinfo)
+
+    return max(0.0, (now - started_at).total_seconds())
+
+
+def _register_metadata_message_for_current_track(
+    ctx: commands.Context,
+    track_id: int | None,
+    sent_message: Any,
+) -> None:
+    """Track metadata messages so they can be removed when the current song ends."""
+    if not ctx.guild or not isinstance(track_id, int):
+        return
+    if not isinstance(sent_message, discord.Message):
+        return
+
+    if not _is_current_track_id(ctx.guild.id, track_id):
+        return
+
+    refs = metadata_message_refs_by_guild.setdefault(ctx.guild.id, [])
+    refs.append(
+        {
+            "track_id": track_id,
+            "channel_id": sent_message.channel.id,
+            "message_id": sent_message.id,
+        }
+    )
+    if len(refs) > 200:
+        del refs[:-200]
+
+
+async def _send_trackable_metadata_message(ctx: commands.Context, *args: Any, **kwargs: Any) -> Any:
+    """Send metadata responses and return a message object when possible."""
+    if getattr(ctx, "interaction", None) is not None:
+        kwargs.setdefault("wait", True)
+    return await ctx.send(*args, **kwargs)
+
+
+async def _delete_metadata_messages_for_track(guild_id: int, track_id: int) -> None:
+    """Delete tracked metadata messages associated with the finished track."""
+    refs = metadata_message_refs_by_guild.get(guild_id, [])
+    if not refs:
+        return
+
+    remaining_refs: list[dict[str, int]] = []
+    for ref in refs:
+        if ref.get("track_id") != track_id:
+            remaining_refs.append(ref)
+            continue
+
+        channel_id = ref.get("channel_id")
+        message_id = ref.get("message_id")
+        if not isinstance(channel_id, int) or not isinstance(message_id, int):
+            continue
+
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            guild = bot.get_guild(guild_id)
+            if guild is not None:
+                channel = guild.get_channel(channel_id) or guild.get_thread(channel_id)
+        if channel is None:
+            continue
+
+        try:
+            if hasattr(channel, "get_partial_message"):
+                await channel.get_partial_message(message_id).delete()
+            else:
+                message = await channel.fetch_message(message_id)
+                await message.delete()
+        except (discord.NotFound, discord.Forbidden):
+            pass
+        except Exception as exc:
+            logger.debug("Failed deleting metadata message %s in guild %s: %s", message_id, guild_id, exc)
+
+    if remaining_refs:
+        metadata_message_refs_by_guild[guild_id] = remaining_refs
+    else:
+        metadata_message_refs_by_guild.pop(guild_id, None)
 
 
 async def _check_voice(ctx: commands.Context) -> bool:
@@ -958,11 +1101,18 @@ async def play_next(ctx: commands.Context):
         # This happens when vc.stop() is called during a disconnect or handshake teardown.
         current_vc = ctx.voice_client
         if not current_vc or not current_vc.is_connected():
-            current_tracks.pop(gid, None)
+            disconnected_track = current_tracks.pop(gid, None)
+            disconnected_track_id = _track_entry_id(disconnected_track)
+            if disconnected_track_id is not None:
+                asyncio.run_coroutine_threadsafe(
+                    _delete_metadata_messages_for_track(gid, disconnected_track_id),
+                    bot.loop,
+                )
             return
 
         # Move current track to history
         finished_track = current_tracks.pop(gid, None)
+        finished_track_id = _track_entry_id(finished_track)
         mode = get_loop_mode(gid)
 
         if finished_track:
@@ -978,6 +1128,12 @@ async def play_next(ctx: commands.Context):
                     q.append(finished_track)
 
         skip_requests.discard(gid)
+
+        if finished_track_id is not None:
+            asyncio.run_coroutine_threadsafe(
+                _delete_metadata_messages_for_track(gid, finished_track_id),
+                bot.loop,
+            )
 
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
@@ -1383,10 +1539,14 @@ async def on_voice_state_update(member, before, after):
         if not members:
             gid = member.guild.id
             queues.pop(gid, None)
-            current_tracks.pop(gid, None)
+            finished_track = current_tracks.pop(gid, None)
+            finished_track_id = _track_entry_id(finished_track)
             loop_modes.pop(gid, None)
             skip_requests.discard(gid)
             save_guild_state(gid)
+
+            if finished_track_id is not None:
+                await _delete_metadata_messages_for_track(gid, finished_track_id)
             
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
@@ -1455,6 +1615,17 @@ async def help_cmd(ctx: commands.Context):
                 "`u!stop` — Stop playback, clear the queue, and disconnect",
             ]
             if line is not None
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🧾 Metadata",
+        value=(
+            "`u!spectrogram [query or song URL]` — Send a spectrogram image (`u!spectogram`, `u!spec`)\n"
+            "`u!trackinfo [query or song URL]` — Show artist, album, year, and track metadata\n"
+            "`u!cover [query or song URL]` — Show album art\n"
+            "`u!lyrics [query or song URL]` — Show lyrics (with TXT attachment if long)\n"
+            "`u!audiostats [query or song URL]` — Probe codec, bitrate, sample rate, and channels"
         ),
         inline=False,
     )
@@ -3073,7 +3244,7 @@ async def queue_cmd(ctx: commands.Context, page: int = 1):
         if len(text) <= max_len:
             return text
         return text[: max_len - 1] + "…"
-    
+
     if not q and not curr:
         await ctx.send("📭 Queue is empty.", silent=True)
         return
@@ -3124,83 +3295,830 @@ async def queue_cmd(ctx: commands.Context, page: int = 1):
     await ctx.send(embed=embed, silent=True)
 
 
+def _tidal_cover_url(cover_id: str | None, size: int = 1280) -> str | None:
+    if not cover_id:
+        return None
+    return f"https://resources.tidal.com/images/{cover_id.replace('-', '/')}/{size}x{size}.jpg"
+
+
+def _format_duration_seconds(duration_seconds: Any) -> str:
+    try:
+        total_seconds = int(float(duration_seconds))
+    except (TypeError, ValueError):
+        return "Unknown"
+
+    if total_seconds <= 0:
+        return "Unknown"
+
+    minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def _format_bitrate(bits_per_second: Any) -> str:
+    try:
+        bps = int(float(bits_per_second))
+    except (TypeError, ValueError):
+        return "Unknown"
+
+    if bps <= 0:
+        return "Unknown"
+    if bps >= 1_000_000:
+        return f"{bps / 1_000_000:.2f} Mbps"
+    if bps >= 1_000:
+        return f"{bps / 1_000:.0f} kbps"
+    return f"{bps} bps"
+
+
+def _safe_filename_stem(value: str, fallback: str = "track") -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", value).strip("._") or fallback
+
+
+async def _resolve_track_context(
+    ctx: commands.Context,
+    query: str | None,
+    non_song_error: str,
+    *,
+    need_stream: bool = False,
+    generation_target: str = "a stream URL",
+    include_album_release: bool = False,
+) -> dict[str, Any] | None:
+    """Resolve a song query/current track to a rich context payload."""
+    gid = ctx.guild.id
+    track_id: int | None = None
+    track_title: str | None = None
+    track_artist: str | None = None
+    stream_url: str | None = None
+    search_query: str | None = None
+
+    if query is None:
+        curr = current_tracks.get(gid)
+        if not curr:
+            await ctx.send("❌ No track currently playing.", silent=True)
+            return None
+
+        track_title = curr.get('title')
+        track_artist = curr.get('artist')
+        stream_url = curr.get('stream_url')
+
+        raw_track_id = curr.get('id')
+        if raw_track_id is not None:
+            try:
+                track_id = int(raw_track_id)
+            except (TypeError, ValueError):
+                track_id = None
+
+        if track_id is None:
+            search_query = f"{track_title or ''} {track_artist or ''}".strip()
+            if not search_query:
+                await ctx.send("❌ Could not determine the currently playing track.", silent=True)
+                return None
+    else:
+        link_type, link_id = parse_tidal_url(query)
+        if link_type in {'album', 'playlist', 'artist'}:
+            await ctx.send(non_song_error, silent=True)
+            return None
+
+        if link_type == 'track':
+            if not link_id:
+                await ctx.send("❌ Invalid song link.", silent=True)
+                return None
+            try:
+                track_id = int(link_id)
+            except ValueError:
+                await ctx.send("❌ Invalid song link.", silent=True)
+                return None
+        else:
+            search_query = query
+
+    async with aiohttp.ClientSession() as session:
+        if search_query:
+            status, data = await api_get(session, f"{TIDAL_API}/search/", {'s': search_query})
+            if status == 429:
+                await ctx.send("⏳ Rate limited by API, try again in a few seconds.", silent=True)
+                return None
+            if status != 200 or not data:
+                await ctx.send(f"❌ Search failed (HTTP {status})", silent=True)
+                return None
+
+            items = data.get('data', {}).get('items', [])
+            if not items:
+                await ctx.send("❌ No results found.", silent=True)
+                return None
+
+            track_entry = items[0]
+            track_title = track_entry.get('title', track_title or 'Unknown')
+            track_artist = (track_entry.get('artist') or {}).get('name', track_artist or 'Unknown')
+            raw_track_id = track_entry.get('id')
+            if raw_track_id is None:
+                await ctx.send("❌ The first search result is not a valid song.", silent=True)
+                return None
+            try:
+                track_id = int(raw_track_id)
+            except (TypeError, ValueError):
+                await ctx.send("❌ The first search result is not a valid song.", silent=True)
+                return None
+
+        if track_id is None:
+            await ctx.send("❌ Could not resolve a valid song ID.", silent=True)
+            return None
+
+        async with session.get(f"{TIDAL_API}/info/", params={'id': track_id}) as resp:
+            if resp.status != 200:
+                await ctx.send(f"❌ Track not found (HTTP {resp.status})", silent=True)
+                return None
+            payload = await resp.json()
+
+        info = payload.get('data', {}) if isinstance(payload, dict) else {}
+        track_title = info.get('title', track_title or 'Unknown')
+        track_artist = (info.get('artist') or {}).get('name', track_artist or 'Unknown')
+        album_data = info.get('album') if isinstance(info.get('album'), dict) else {}
+        album_id = album_data.get('id')
+        cover_id = album_data.get('cover')
+        release_date: str | None = None
+
+        if include_album_release and album_id is not None:
+            try:
+                album_id_int = int(album_id)
+            except (TypeError, ValueError):
+                album_id_int = None
+
+            if album_id_int is not None:
+                album_status, album_payload = await api_get(session, f"{TIDAL_API}/album/", {'id': album_id_int})
+                if album_status == 200 and album_payload:
+                    album_info = album_payload.get('data', {})
+                    if isinstance(album_info, dict):
+                        release_date = album_info.get('releaseDate') or album_info.get('streamStartDate')
+
+        if need_stream and not stream_url:
+            stream_url, http_status = await get_stream_url(session, track_id)
+            if not stream_url:
+                await ctx.send(f"❌ Could not generate {generation_target} (HTTP {http_status}).", silent=True)
+                return None
+
+    return {
+        'id': track_id,
+        'title': track_title or 'Unknown',
+        'artist': track_artist or 'Unknown',
+        'duration': info.get('duration'),
+        'audio_quality': info.get('audioQuality'),
+        'audio_modes': info.get('audioModes') or [],
+        'isrc': info.get('isrc'),
+        'bpm': info.get('bpm'),
+        'key': info.get('key'),
+        'key_scale': info.get('keyScale'),
+        'explicit': info.get('explicit'),
+        'copyright': info.get('copyright'),
+        'track_url': info.get('url'),
+        'album_id': album_id,
+        'album_title': album_data.get('title'),
+        'cover_id': cover_id,
+        'cover_url': _tidal_cover_url(cover_id),
+        'release_date': release_date,
+        'stream_url': stream_url,
+    }
+
+
+async def _resolve_track_title_and_stream(
+    ctx: commands.Context,
+    query: str | None,
+    non_song_error: str,
+    generation_target: str,
+) -> tuple[str | None, str | None]:
+    """Resolve a query (or current track) into track title + stream URL."""
+    track_context = await _resolve_track_context(
+        ctx,
+        query,
+        non_song_error,
+        need_stream=True,
+        generation_target=generation_target,
+    )
+    if not track_context:
+        return None, None
+
+    return track_context.get('title'), track_context.get('stream_url')
+
+
+async def _fetch_track_lyrics(track_id: int) -> tuple[str | None, str | None, str | None]:
+    """Fetch lyrics and subtitle payloads for a track ID."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{TIDAL_API}/lyrics/", params={'id': track_id}) as resp:
+            if resp.status != 200:
+                if resp.status == 404:
+                    return None, None, "❌ Lyrics are not available for this track."
+                return None, None, f"❌ Lyrics lookup failed (HTTP {resp.status})."
+            payload = await resp.json()
+
+    lyrics_block = payload.get('lyrics', {}) if isinstance(payload, dict) else {}
+    lyrics_text = lyrics_block.get('lyrics')
+    subtitles_text = lyrics_block.get('subtitles')
+
+    if isinstance(lyrics_text, str):
+        lyrics_text = lyrics_text.strip()
+    else:
+        lyrics_text = None
+
+    if isinstance(subtitles_text, str):
+        subtitles_text = subtitles_text.strip()
+    else:
+        subtitles_text = None
+
+    if not lyrics_text and not subtitles_text:
+        return None, None, "❌ Lyrics are not available for this track."
+    return lyrics_text, subtitles_text, None
+
+
+def _parse_timestamped_lyrics(subtitles_text: str | None) -> list[tuple[float, str]]:
+    if not isinstance(subtitles_text, str) or not subtitles_text.strip():
+        return []
+
+    entries: list[tuple[float, str]] = []
+    for raw_line in subtitles_text.splitlines():
+        timestamp_matches = list(TIMESTAMPED_LYRICS_LINE_RE.finditer(raw_line))
+        if not timestamp_matches:
+            continue
+
+        line_text = TIMESTAMPED_LYRICS_LINE_RE.sub("", raw_line).strip()
+        if not line_text:
+            continue
+
+        for match in timestamp_matches:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            fraction_raw = match.group(3)
+            fraction = int(fraction_raw) / (10 ** len(fraction_raw)) if fraction_raw else 0.0
+            entries.append((minutes * 60 + seconds + fraction, line_text))
+
+    entries.sort(key=lambda item: item[0])
+    deduped: list[tuple[float, str]] = []
+    for timestamp, line_text in entries:
+        if deduped and abs(deduped[-1][0] - timestamp) < 1e-9 and deduped[-1][1] == line_text:
+            continue
+        deduped.append((timestamp, line_text))
+    return deduped
+
+
+def _timestamped_lyrics_index_for_elapsed(
+    timed_lines: list[tuple[float, str]],
+    elapsed_seconds: float,
+) -> int:
+    if not timed_lines:
+        return 0
+
+    index = 0
+    for idx, (timestamp, _) in enumerate(timed_lines):
+        if timestamp <= elapsed_seconds:
+            index = idx
+        else:
+            break
+    return index
+
+
+def _flatten_timestamped_lyrics(timed_lines: list[tuple[float, str]]) -> str:
+    return "\n".join(line_text for _, line_text in timed_lines)
+
+
+def _build_synced_lyrics_embed(
+    title: str,
+    artist: str,
+    timed_lines: list[tuple[float, str]],
+    index: int,
+) -> discord.Embed:
+    prev_line = timed_lines[index - 1][1] if index > 0 else "..."
+    curr_line = timed_lines[index][1]
+    next_line = timed_lines[index + 1][1] if index + 1 < len(timed_lines) else "..."
+
+    embed = discord.Embed(
+        title=f"📝 Lyrics — {title}",
+        description=f"⬆️ {prev_line}\n\n🎤 **{curr_line}**\n\n⬇️ {next_line}",
+        color=0x1db954,
+    )
+    embed.set_footer(text=f"{artist} • line {index + 1}/{len(timed_lines)}")
+    return embed
+
+
+async def _run_synced_lyrics_updates(
+    sent_message: discord.Message,
+    *,
+    title: str,
+    artist: str,
+    timed_lines: list[tuple[float, str]],
+    start_index: int,
+    start_elapsed: float,
+    guild_id: int | None,
+    track_id: int,
+    enforce_current_track: bool,
+) -> None:
+    if not timed_lines:
+        return
+
+    anchor_monotonic = time.monotonic() - max(0.0, start_elapsed)
+
+    for next_index in range(start_index + 1, len(timed_lines)):
+        next_timestamp = timed_lines[next_index][0]
+        target_time = anchor_monotonic + next_timestamp
+
+        while True:
+            if enforce_current_track and isinstance(guild_id, int) and not _is_current_track_id(guild_id, track_id):
+                return
+
+            remaining = target_time - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(remaining, 1.0))
+
+        if enforce_current_track and isinstance(guild_id, int) and not _is_current_track_id(guild_id, track_id):
+            return
+
+        embed = _build_synced_lyrics_embed(title, artist, timed_lines, next_index)
+        try:
+            await sent_message.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden):
+            return
+        except Exception as exc:
+            logger.debug("Failed to update synced lyrics message %s: %s", sent_message.id, exc)
+            return
+
+
+def _start_synced_lyrics_updates(task_coro: Awaitable[None]) -> None:
+    task = asyncio.create_task(task_coro)
+
+    def _handle_task_done(done_task: asyncio.Task) -> None:
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Synced lyrics updater task failed: %s", exc)
+
+    task.add_done_callback(_handle_task_done)
+
+
+async def _probe_audio_stream(stream_url: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Probe stream codec and transport stats using ffprobe."""
+    ffprobe_cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        stream_url,
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *ffprobe_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return None, "❌ ffprobe is not installed or not available in PATH."
+    except Exception as e:
+        logger.error("Failed to launch ffprobe: %s", e)
+        return None, "❌ Could not start ffprobe for audio stats."
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return None, "❌ Timed out while probing audio stats."
+
+    if process.returncode != 0 or not stdout:
+        probe_error = (stderr or b"").decode(errors="replace").strip()
+        if probe_error:
+            logger.warning("ffprobe audio stats failed: %s", probe_error[:400])
+        return None, "❌ Could not read audio stats for this track."
+
+    try:
+        payload = json.loads(stdout.decode(errors="replace"))
+    except json.JSONDecodeError:
+        return None, "❌ Received invalid ffprobe output while reading audio stats."
+
+    streams = payload.get('streams') if isinstance(payload, dict) else None
+    if not isinstance(streams, list):
+        return None, "❌ Could not find an audio stream in ffprobe output."
+
+    audio_stream = next((stream for stream in streams if stream.get('codec_type') == 'audio'), None)
+    if not audio_stream:
+        return None, "❌ Could not find an audio stream in ffprobe output."
+
+    format_block = payload.get('format') if isinstance(payload.get('format'), dict) else {}
+    return {
+        'codec': audio_stream.get('codec_name'),
+        'sample_rate': audio_stream.get('sample_rate'),
+        'channels': audio_stream.get('channels'),
+        'channel_layout': audio_stream.get('channel_layout'),
+        'stream_bitrate': audio_stream.get('bit_rate'),
+        'container_bitrate': format_block.get('bit_rate'),
+        'duration': format_block.get('duration') or audio_stream.get('duration'),
+    }, None
+
+
+async def _generate_spectrogram_image(stream_url: str, image_size: str) -> tuple[bytes | None, str | None]:
+    """Render a spectrogram PNG from an audio stream using FFmpeg."""
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-reconnect",
+        "1",
+        "-reconnect_at_eof",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+        "-i",
+        stream_url,
+        "-t",
+        "30",
+        "-lavfi",
+        f"showspectrumpic=s={image_size}:legend=1:orientation=vertical:scale=log",
+        "-frames:v",
+        "1",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "pipe:1",
+    ]
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return None, "❌ FFmpeg is not installed or not available in PATH."
+    except Exception as e:
+        logger.error("Failed to launch FFmpeg for spectrogram generation: %s", e)
+        return None, "❌ Could not start FFmpeg to generate spectrogram image."
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=75)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        return None, "❌ Timed out while generating spectrogram image."
+
+    if process.returncode != 0 or not stdout:
+        ffmpeg_error = (stderr or b"").decode(errors="replace").strip()
+        if ffmpeg_error:
+            logger.warning("FFmpeg spectrogram generation failed: %s", ffmpeg_error[:400])
+        return None, "❌ Could not generate spectrogram image for this track."
+
+    return stdout, None
+
+
+async def _generate_best_spectrogram_image(
+    ctx: commands.Context,
+    stream_url: str,
+) -> tuple[bytes | None, str | None, str | None]:
+    """Pick the largest configured spectrogram size that fits Discord's upload cap."""
+    guild_limit = getattr(ctx.guild, "filesize_limit", None) if ctx.guild else None
+    if isinstance(guild_limit, int) and guild_limit > 0:
+        upload_limit_bytes = guild_limit
+    else:
+        upload_limit_bytes = SPECTROGRAM_FALLBACK_UPLOAD_LIMIT_BYTES
+
+    target_budget_bytes = max(512 * 1024, upload_limit_bytes - SPECTROGRAM_UPLOAD_HEADROOM_BYTES)
+    last_error: str | None = None
+
+    for image_size in SPECTROGRAM_SIZE_CANDIDATES:
+        image_bytes, error_message = await _generate_spectrogram_image(stream_url, image_size)
+        if image_bytes:
+            byte_count = len(image_bytes)
+            if byte_count <= target_budget_bytes:
+                logger.info(
+                    "Selected spectrogram size %s (%d bytes, guild limit %d bytes)",
+                    image_size,
+                    byte_count,
+                    upload_limit_bytes,
+                )
+                return image_bytes, None, image_size
+            logger.info(
+                "Spectrogram size %s too large (%d bytes > %d byte budget), trying smaller size.",
+                image_size,
+                byte_count,
+                target_budget_bytes,
+            )
+            continue
+
+        if error_message and "not installed" in error_message.lower():
+            return None, error_message, None
+        if error_message:
+            last_error = error_message
+
+    if last_error:
+        return None, last_error, None
+
+    limit_mb = max(1, upload_limit_bytes // (1024 * 1024))
+    return None, f"❌ Could not render a spectrogram image that fits this server's {limit_mb} MB upload limit.", None
+
+
 @bot.hybrid_command(name="link")
 async def link_cmd(ctx: commands.Context, *, query: str | None = None):
     if not is_link_enabled(ctx.guild.id):
         return
 
-    gid = ctx.guild.id
-    track_title = None
-    stream_url = None
-
-    if query is None:
-        curr = current_tracks.get(gid)
-        if not curr or 'stream_url' not in curr:
-            await ctx.send("❌ No track currently playing or stream link unavailable.", silent=True)
-            return
-        track_title = curr['title']
-        stream_url = curr['stream_url']
-    else:
-        link_type, link_id = parse_tidal_url(query)
-        if link_type in {'album', 'playlist', 'artist'}:
-            await ctx.send("❌ Download links only work for songs, not albums, playlists, or artists.", silent=True)
-            return
-
-        if link_type == 'track':
-            if not link_id:
-                await ctx.send("❌ Invalid song link.", silent=True)
-                return
-            try:
-                track_id = int(link_id)
-            except ValueError:
-                await ctx.send("❌ Invalid song link.", silent=True)
-                return
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{TIDAL_API}/info/", params={'id': track_id}) as resp:
-                    if resp.status != 200:
-                        await ctx.send(f"❌ Track not found (HTTP {resp.status})", silent=True)
-                        return
-                    data = await resp.json()
-                    info = data.get('data', {})
-                    track_title = info.get('title', 'Unknown')
-
-            async with aiohttp.ClientSession() as stream_session:
-                stream_url, http_status = await get_stream_url(stream_session, track_id)
-            if not stream_url:
-                await ctx.send(f"❌ Could not generate a download link (HTTP {http_status}).", silent=True)
-                return
-        else:
-            async with aiohttp.ClientSession() as session:
-                status, data = await api_get(session, f"{TIDAL_API}/search/", {'s': query})
-                if status == 429:
-                    await ctx.send("⏳ Rate limited by API, try again in a few seconds.", silent=True)
-                    return
-                if status != 200 or not data:
-                    await ctx.send(f"❌ Search failed (HTTP {status})", silent=True)
-                    return
-                items = data.get('data', {}).get('items', [])
-                if not items:
-                    await ctx.send("❌ No results found.", silent=True)
-                    return
-                track = items[0]
-                track_title = track.get('title', 'Unknown')
-                track_id = track.get('id')
-                if not track_id:
-                    await ctx.send("❌ The first search result is not a valid song.", silent=True)
-                    return
-
-            async with aiohttp.ClientSession() as stream_session:
-                stream_url, http_status = await get_stream_url(stream_session, int(track_id))
-            if not stream_url:
-                await ctx.send(f"❌ Could not generate a download link (HTTP {http_status}).", silent=True)
-                return
+    track_title, stream_url = await _resolve_track_title_and_stream(
+        ctx,
+        query,
+        non_song_error="❌ Download links only work for songs, not albums, playlists, or artists.",
+        generation_target="a download link",
+    )
+    if track_title is None or stream_url is None:
+        return
 
     encoded_src = quote(stream_url, safe=':/?&=%')
     wrapped_url = f"https://mp.astrasphe.re?src=%22{encoded_src}%22&dl=1"
     view = discord.ui.View()
     view.add_item(discord.ui.Button(label="Download Link", url=wrapped_url))
     await ctx.send(f"🔗 **Download Link for {track_title}**", view=view, silent=True, delete_after=30)
+
+
+@bot.hybrid_command(name="spectrogram", aliases=["spectogram", "spec"])
+async def spectrogram_cmd(ctx: commands.Context, *, query: str | None = None):
+    await ctx.defer()
+    track_context = await _resolve_track_context(
+        ctx,
+        query,
+        non_song_error="❌ Spectrogram images only work for songs, not albums, playlists, or artists.",
+        need_stream=True,
+        generation_target="a spectrogram image",
+    )
+    if not track_context:
+        return
+
+    track_id = _track_entry_id(track_context)
+    track_title = track_context.get('title', 'Unknown')
+    stream_url = track_context.get('stream_url')
+    if not stream_url:
+        await ctx.send("❌ Could not resolve a stream for this track.", silent=True)
+        return
+
+    image_bytes, error_message, selected_size = await _generate_best_spectrogram_image(ctx, stream_url)
+    if not image_bytes:
+        await ctx.send(error_message or "❌ Could not generate spectrogram image.", silent=True)
+        return
+
+    safe_track_name = _safe_filename_stem(track_title, fallback="track")
+    image_file = discord.File(io.BytesIO(image_bytes), filename=f"{safe_track_name}_spectrogram.png")
+    resolution_label = selected_size or "auto"
+    sent_message = await _send_trackable_metadata_message(ctx, f"🖼️ **Spectrogram for {track_title}** ({resolution_label})", file=image_file, silent=True)
+    _register_metadata_message_for_current_track(ctx, track_id, sent_message)
+
+
+@bot.hybrid_command(name="trackinfo", aliases=["meta", "songinfo"])
+async def trackinfo_cmd(ctx: commands.Context, *, query: str | None = None):
+    """Show detailed track metadata."""
+    await ctx.defer()
+
+    track_context = await _resolve_track_context(
+        ctx,
+        query,
+        non_song_error="❌ Track info only works for songs, not albums, playlists, or artists.",
+        include_album_release=True,
+    )
+    if not track_context:
+        return
+
+    track_id = _track_entry_id(track_context)
+
+    title = track_context.get('title', 'Unknown')
+    artist = track_context.get('artist', 'Unknown')
+    release_date = track_context.get('release_date')
+    release_year = release_date[:4] if isinstance(release_date, str) and len(release_date) >= 4 else "Unknown"
+    key_root = track_context.get('key')
+    key_scale = track_context.get('key_scale')
+    musical_key = f"{key_root} {key_scale}" if key_root and key_scale else key_root or "Unknown"
+
+    embed = discord.Embed(
+        title="🎼 Track Info",
+        description=f"**{title}** — {artist}",
+        color=0x1db954,
+    )
+    embed.add_field(name="Album", value=track_context.get('album_title') or "Unknown", inline=True)
+    embed.add_field(name="Release Year", value=release_year, inline=True)
+    embed.add_field(name="Duration", value=_format_duration_seconds(track_context.get('duration')), inline=True)
+    embed.add_field(name="Audio Quality", value=track_context.get('audio_quality') or "Unknown", inline=True)
+    embed.add_field(name="ISRC", value=track_context.get('isrc') or "Unknown", inline=True)
+    embed.add_field(name="BPM / Key", value=f"{track_context.get('bpm') or 'Unknown'} / {musical_key}", inline=True)
+
+    cover_url = track_context.get('cover_url')
+    if cover_url:
+        embed.set_thumbnail(url=cover_url)
+
+    track_url = track_context.get('track_url')
+    if track_url:
+        embed.add_field(name="Track URL", value=track_url, inline=False)
+
+    sent_message = await _send_trackable_metadata_message(ctx, embed=embed, silent=True)
+    _register_metadata_message_for_current_track(ctx, track_id, sent_message)
+
+
+@bot.hybrid_command(name="cover", aliases=["art", "albumart"])
+async def cover_cmd(ctx: commands.Context, *, query: str | None = None):
+    """Show album art for a song."""
+    await ctx.defer()
+
+    track_context = await _resolve_track_context(
+        ctx,
+        query,
+        non_song_error="❌ Cover art only works for songs, not albums, playlists, or artists.",
+        include_album_release=True,
+    )
+    if not track_context:
+        return
+
+    track_id = _track_entry_id(track_context)
+
+    cover_url = track_context.get('cover_url')
+    if not cover_url:
+        await ctx.send("❌ No album art found for this track.", silent=True)
+        return
+
+    title = track_context.get('title', 'Unknown')
+    artist = track_context.get('artist', 'Unknown')
+    album_title = track_context.get('album_title') or "Unknown Album"
+
+    embed = discord.Embed(
+        title="🖼️ Album Art",
+        description=f"**{title}** — {artist}\nAlbum: **{album_title}**",
+        color=0x1db954,
+    )
+    embed.set_image(url=cover_url)
+    release_date = track_context.get('release_date')
+    if isinstance(release_date, str) and release_date:
+        embed.set_footer(text=f"Release: {release_date[:10]}")
+
+    sent_message = await _send_trackable_metadata_message(ctx, embed=embed, silent=True)
+    _register_metadata_message_for_current_track(ctx, track_id, sent_message)
+
+
+@bot.hybrid_command(name="lyrics")
+async def lyrics_cmd(ctx: commands.Context, *, query: str | None = None):
+    """Show track lyrics, with file fallback for very long lyrics."""
+    await ctx.defer()
+
+    track_context = await _resolve_track_context(
+        ctx,
+        query,
+        non_song_error="❌ Lyrics only work for songs, not albums, playlists, or artists.",
+    )
+    if not track_context:
+        return
+
+    track_id = track_context.get('id')
+    if not isinstance(track_id, int):
+        await ctx.send("❌ Could not resolve a valid track for lyrics.", silent=True)
+        return
+
+    lyrics_text, subtitles_text, lyrics_error = await _fetch_track_lyrics(track_id)
+    if not lyrics_text and not subtitles_text:
+        await ctx.send(lyrics_error or "❌ Lyrics are unavailable for this track.", silent=True)
+        return
+
+    title = track_context.get('title', 'Unknown')
+    artist = track_context.get('artist', 'Unknown')
+    timed_lines = _parse_timestamped_lyrics(subtitles_text)
+    is_current_track = bool(ctx.guild and _is_current_track_id(ctx.guild.id, track_id))
+
+    if timed_lines:
+        start_elapsed = _current_track_elapsed_seconds(ctx.guild.id, track_id) if is_current_track and ctx.guild else 0.0
+        current_index = _timestamped_lyrics_index_for_elapsed(timed_lines, start_elapsed)
+
+        embed = _build_synced_lyrics_embed(title, artist, timed_lines, current_index)
+        sent_message = await _send_trackable_metadata_message(ctx, embed=embed, silent=True)
+        _register_metadata_message_for_current_track(ctx, track_id, sent_message)
+
+        if current_index < len(timed_lines) - 1:
+            _start_synced_lyrics_updates(
+                _run_synced_lyrics_updates(
+                    sent_message,
+                    title=title,
+                    artist=artist,
+                    timed_lines=timed_lines,
+                    start_index=current_index,
+                    start_elapsed=start_elapsed,
+                    guild_id=ctx.guild.id if ctx.guild else None,
+                    track_id=track_id,
+                    enforce_current_track=is_current_track,
+                )
+            )
+        return
+
+    lyrics_body = lyrics_text or _flatten_timestamped_lyrics(timed_lines) or subtitles_text
+    if not isinstance(lyrics_body, str) or not lyrics_body:
+        await ctx.send("❌ Lyrics are unavailable for this track.", silent=True)
+        return
+
+    max_embed_chars = 3400
+
+    if len(lyrics_body) <= max_embed_chars:
+        embed = discord.Embed(
+            title=f"📝 Lyrics — {title}",
+            description=lyrics_body,
+            color=0x1db954,
+        )
+        embed.set_footer(text=artist)
+        sent_message = await _send_trackable_metadata_message(ctx, embed=embed, silent=True)
+        _register_metadata_message_for_current_track(ctx, track_id, sent_message)
+        return
+
+    preview = lyrics_body[:max_embed_chars].rstrip() + "\n\n... (truncated; full lyrics attached)"
+    safe_name = _safe_filename_stem(f"{artist}_{title}", fallback="lyrics")
+    lyrics_file = discord.File(io.BytesIO(lyrics_body.encode("utf-8")), filename=f"{safe_name}_lyrics.txt")
+
+    embed = discord.Embed(
+        title=f"📝 Lyrics — {title}",
+        description=preview,
+        color=0x1db954,
+    )
+    embed.set_footer(text=artist)
+    sent_message = await _send_trackable_metadata_message(ctx, embed=embed, file=lyrics_file, silent=True)
+    _register_metadata_message_for_current_track(ctx, track_id, sent_message)
+
+
+@bot.hybrid_command(name="audiostats", aliases=["stats"])
+async def audiostats_cmd(ctx: commands.Context, *, query: str | None = None):
+    """Probe codec and stream transport metadata."""
+    await ctx.defer()
+
+    track_context = await _resolve_track_context(
+        ctx,
+        query,
+        non_song_error="❌ Audio stats only work for songs, not albums, playlists, or artists.",
+        need_stream=True,
+        generation_target="audio stats",
+    )
+    if not track_context:
+        return
+
+    track_id = _track_entry_id(track_context)
+
+    stream_url = track_context.get('stream_url')
+    if not stream_url:
+        await ctx.send("❌ Could not resolve a stream for this track.", silent=True)
+        return
+
+    stats, probe_error = await _probe_audio_stream(stream_url)
+    if not stats:
+        await ctx.send(probe_error or "❌ Could not read audio stats for this track.", silent=True)
+        return
+
+    title = track_context.get('title', 'Unknown')
+    artist = track_context.get('artist', 'Unknown')
+    sample_rate = stats.get('sample_rate')
+    try:
+        sample_rate_hz = int(sample_rate)
+        sample_rate_label = f"{sample_rate_hz / 1000:.1f} kHz"
+    except (TypeError, ValueError):
+        sample_rate_label = "Unknown"
+
+    channels = stats.get('channels')
+    channel_layout = stats.get('channel_layout')
+    if channels and channel_layout:
+        channel_label = f"{channels} ({channel_layout})"
+    elif channels:
+        channel_label = str(channels)
+    else:
+        channel_label = "Unknown"
+
+    duration_value = stats.get('duration')
+    duration_label = _format_duration_seconds(duration_value)
+
+    embed = discord.Embed(
+        title="📊 Audio Stats",
+        description=f"**{title}** — {artist}",
+        color=0x1db954,
+    )
+    embed.add_field(name="Codec", value=stats.get('codec') or "Unknown", inline=True)
+    embed.add_field(name="Sample Rate", value=sample_rate_label, inline=True)
+    embed.add_field(name="Channels", value=channel_label, inline=True)
+    embed.add_field(name="Stream Bitrate", value=_format_bitrate(stats.get('stream_bitrate')), inline=True)
+    embed.add_field(name="Container Bitrate", value=_format_bitrate(stats.get('container_bitrate')), inline=True)
+    embed.add_field(name="Duration", value=duration_label, inline=True)
+    embed.add_field(name="Tidal Quality", value=track_context.get('audio_quality') or "Unknown", inline=True)
+    audio_modes = track_context.get('audio_modes')
+    if isinstance(audio_modes, list) and audio_modes:
+        embed.add_field(name="Audio Modes", value=", ".join(str(mode) for mode in audio_modes), inline=True)
+
+    sent_message = await _send_trackable_metadata_message(ctx, embed=embed, silent=True)
+    _register_metadata_message_for_current_track(ctx, track_id, sent_message)
 
 
 @bot.hybrid_command(name="stop")
@@ -3224,8 +4142,11 @@ async def stop(ctx: commands.Context):
         
     gid = ctx.guild.id
     queues.pop(gid, None)
-    current_tracks.pop(gid, None)
+    finished_track = current_tracks.pop(gid, None)
+    finished_track_id = _track_entry_id(finished_track)
     loop_modes.pop(gid, None)
+    if finished_track_id is not None:
+        await _delete_metadata_messages_for_track(gid, finished_track_id)
     vc.stop()
     save_guild_state(gid)
     await vc.disconnect()
