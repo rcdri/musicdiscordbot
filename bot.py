@@ -843,6 +843,19 @@ def _current_track_elapsed_seconds(guild_id: int, track_id: int) -> float:
     return max(0.0, (now - started_at).total_seconds())
 
 
+def _discord_ping_offset_seconds() -> float:
+    """Return a bounded Discord latency offset for lyric sync compensation."""
+    latency = getattr(bot, "latency", 0.0)
+    if not isinstance(latency, (int, float)):
+        return 0.0
+
+    latency = float(latency)
+    if latency < 0 or latency != latency or latency in {float("inf"), float("-inf")}:
+        return 0.0
+
+    return min(latency, 5.0)
+
+
 def _register_metadata_message_for_current_track(
     ctx: commands.Context,
     track_id: int | None,
@@ -3953,7 +3966,9 @@ async def lyrics_cmd(ctx: commands.Context, *, query: str | None = None):
     is_current_track = bool(ctx.guild and _is_current_track_id(ctx.guild.id, track_id))
 
     if timed_lines:
-        start_elapsed = _current_track_elapsed_seconds(ctx.guild.id, track_id) if is_current_track and ctx.guild else 0.0
+        base_elapsed = _current_track_elapsed_seconds(ctx.guild.id, track_id) if is_current_track and ctx.guild else 0.0
+        ping_offset = _discord_ping_offset_seconds()
+        start_elapsed = base_elapsed + ping_offset
         current_index = _timestamped_lyrics_index_for_elapsed(timed_lines, start_elapsed)
 
         embed = _build_synced_lyrics_embed(title, artist, timed_lines, current_index)
