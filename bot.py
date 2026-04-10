@@ -89,17 +89,7 @@ async def pick_best_api():
 QUEUE_COLUMNS = 3
 QUEUE_ROWS_PER_COLUMN = 8
 QUEUE_PAGE_SIZE = QUEUE_COLUMNS * QUEUE_ROWS_PER_COLUMN
-SPECTROGRAM_SIZE_CANDIDATES = [
-    "5120x2880",
-    "4096x2304",
-    "3840x2160",
-    "3200x1800",
-    "2560x1440",
-    "1920x1080",
-    "1280x720",
-]
-SPECTROGRAM_UPLOAD_HEADROOM_BYTES = 256 * 1024
-SPECTROGRAM_FALLBACK_UPLOAD_LIMIT_BYTES = 8 * 1024 * 1024
+SPECTROGRAM_FIXED_SIZE = "854x480"
 TIMESTAMPED_LYRICS_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
 intents = discord.Intents.default()
 intents.message_content = True
@@ -3784,49 +3774,14 @@ async def _generate_spectrogram_image(stream_url: str, image_size: str) -> tuple
 
 
 async def _generate_best_spectrogram_image(
-    ctx: commands.Context,
+    _ctx: commands.Context,
     stream_url: str,
 ) -> tuple[bytes | None, str | None, str | None]:
-    """Pick the largest configured spectrogram size that fits Discord's upload cap."""
-    guild_limit = getattr(ctx.guild, "filesize_limit", None) if ctx.guild else None
-    if isinstance(guild_limit, int) and guild_limit > 0:
-        upload_limit_bytes = guild_limit
-    else:
-        upload_limit_bytes = SPECTROGRAM_FALLBACK_UPLOAD_LIMIT_BYTES
-
-    target_budget_bytes = max(512 * 1024, upload_limit_bytes - SPECTROGRAM_UPLOAD_HEADROOM_BYTES)
-    last_error: str | None = None
-
-    for image_size in SPECTROGRAM_SIZE_CANDIDATES:
-        image_bytes, error_message = await _generate_spectrogram_image(stream_url, image_size)
-        if image_bytes:
-            byte_count = len(image_bytes)
-            if byte_count <= target_budget_bytes:
-                logger.info(
-                    "Selected spectrogram size %s (%d bytes, guild limit %d bytes)",
-                    image_size,
-                    byte_count,
-                    upload_limit_bytes,
-                )
-                return image_bytes, None, image_size
-            logger.info(
-                "Spectrogram size %s too large (%d bytes > %d byte budget), trying smaller size.",
-                image_size,
-                byte_count,
-                target_budget_bytes,
-            )
-            continue
-
-        if error_message and "not installed" in error_message.lower():
-            return None, error_message, None
-        if error_message:
-            last_error = error_message
-
-    if last_error:
-        return None, last_error, None
-
-    limit_mb = max(1, upload_limit_bytes // (1024 * 1024))
-    return None, f"❌ Could not render a spectrogram image that fits this server's {limit_mb} MB upload limit.", None
+    """Render a fixed 480p spectrogram to minimize CPU and RAM usage."""
+    image_bytes, error_message = await _generate_spectrogram_image(stream_url, SPECTROGRAM_FIXED_SIZE)
+    if image_bytes:
+        return image_bytes, None, SPECTROGRAM_FIXED_SIZE
+    return None, error_message or "❌ Could not generate spectrogram image for this track.", None
 
 
 @bot.hybrid_command(name="link")
